@@ -2,29 +2,42 @@ import numpy as np
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, accuracy_score
 
-
 class SeqCrossValidator:
-    def __init__(self, mask_value=np.nan, mask_fraction=0.1, mask_type='random', data_types=None, **kwargs):
+    def __init__(self, mask_value=np.nan, mask_fraction=0.1, mask_type='random', data_types=None,
+                 fit_wrapper = lambda x: x,
+                 predict_wrapper = lambda x: x,
+                 **kwargs):
         self.mask_value = mask_value
         self.mask_fraction = mask_fraction
         self.mask_type = mask_type  # 'random' or 'last'
-        self.data_types = data_types if data_types is not None else {}  # a dictionary mapping channel names to data types ('numerical' or 'categorical')
+        self.data_types = data_types if data_types is not None else {'channel 1':'numerical'}  # a dictionary mapping channel names to data types ('numerical' or 'categorical')
         self.folds_results = []
+        self.fit_wrapper = fit_wrapper
+        self.predict_wrapper = predict_wrapper
 
     def _mask_data(self, data):
         masked_data = {}
         masks = {}
         for channel, sequences in data.items():
             existing_missing_mask = np.isnan(sequences)
-            mask = np.zeros(sequences.shape, dtype=bool)
+
+            # Initialize the mask to all False (no elements are masked yet)
+            mask = np.zeros_like(sequences, dtype=bool)
 
             if self.mask_type == 'random':
-                random_mask = np.random.rand(*sequences.shape[:2]) < self.mask_fraction
-                combined_mask = np.logical_and(~existing_missing_mask[:, :, 0], random_mask)
-                mask = np.repeat(combined_mask[:, :, np.newaxis], sequences.shape[2], axis=2)
+                # Create a random mask with the same shape as sequences
+                random_mask_shape = sequences.shape[:-1] + (1,) if sequences.ndim > 2 else sequences.shape
+                random_mask = np.random.rand(*random_mask_shape) < self.mask_fraction
+
+                # For multi-dimensional case, existing_missing_mask might need to be expanded
+                if existing_missing_mask.ndim < sequences.ndim:
+                    existing_missing_mask = np.expand_dims(existing_missing_mask, axis=-1)
+
+                # Apply the random mask where there is no existing missing data
+                mask = np.logical_and(~existing_missing_mask, random_mask)
             elif self.mask_type == 'last':
                 num_to_mask = int(np.ceil(sequences.shape[1] * self.mask_fraction))
-                mask[:, -num_to_mask:, :] = True
+                mask[..., -num_to_mask:, :] = True
                 mask = np.logical_and(~existing_missing_mask, mask)
             else:
                 raise ValueError("Invalid mask_type. Choose 'random' or 'last'.")
@@ -35,7 +48,7 @@ class SeqCrossValidator:
 
         return masked_data, masks
 
-    def validate(self, model, data, folds, fit_kwargs=None, predict_kwargs=None, **kwargs):
+    def validate(self, model,data,folds, fit_kwargs=None, predict_kwargs=None, **kwargs):
         if fit_kwargs is None:
             fit_kwargs = {}
         if predict_kwargs is None:
@@ -44,7 +57,7 @@ class SeqCrossValidator:
         kf = KFold(n_splits=folds, shuffle=False)
 
         fold = 0
-        for train_index, test_index in kf.split(list(data.values())[0]):
+        for train_index, test_index in kf.split(data[list(data.keys())[0]]):
             fold += 1
             print(f"Validating fold {fold}...")
 
@@ -52,9 +65,16 @@ class SeqCrossValidator:
             test_data = {channel: sequences[test_index] for channel, sequences in data.items()}
             masked_data, masks = self._mask_data(test_data)
 
-            model.fit(train_data, **fit_kwargs)
+            # add data to the fit_kwargs dictioanry:
+            for key in list(data.keys()):
+                fit_kwargs[key] = train_data[key]
 
-            predicted = model.predict(masked_data, **predict_kwargs)
+            model.fit(**fit_kwargs)
+
+            for key in list(data.keys()):
+                predict_kwargs[key] = masked_data[key]
+
+            predicted = self.predict_wrapper(model.predict(**predict_kwargs))
 
             results = self.evaluate_model(test_data, predicted, masks)
 
